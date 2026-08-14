@@ -5,6 +5,7 @@ from lightx2v_train.utils.registry import build_trainer
 _LAZY_EXPORTS = {
     "ARDmdTrainer": (".dmd.video_ar_trainer", "VideoArDmdTrainer"),
     "DmdTrainer": (".dmd.trainer", "DmdTrainer"),
+    "ImageEditDmdTrainer": (".dmd.image_edit_trainer", "ImageEditDmdTrainer"),
     "DopsdTrainer": (".dopsd", "DopsdTrainer"),
     "FastWAMTrainer": (".fastwam", "FastWAMTrainer"),
     "FlowMatchingTrainer": (".flow", "FlowMatchingTrainer"),
