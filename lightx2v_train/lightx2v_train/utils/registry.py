@@ -92,6 +92,7 @@ _MODEL_MODULES = {
 
 _TRAINER_MODULES = {
     "dmd": "lightx2v_train.trainers.dmd.trainer",
+    "image_edit_dmd": "lightx2v_train.trainers.dmd.image_edit_trainer",
     "dopsd": "lightx2v_train.trainers.dopsd",
     "fastwam": "lightx2v_train.trainers.fastwam",
     "flow": "lightx2v_train.trainers.flow",
