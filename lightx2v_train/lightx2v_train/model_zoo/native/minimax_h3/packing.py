@@ -13,6 +13,10 @@ AUDIO_LATENTS_PER_SECOND = 40
 AUDIO_CHANNELS = 2
 FRAMES_PER_CHUNK = 17
 LATENTS_PER_CHUNK = 5
+# Released H3 keyframe conditioning is almost pure noise.  It keeps the
+# visual anchor in the sequence while matching the checkpoint's train-time
+# conditioning distribution.
+KEYFRAME_NOISE_AUG = 0.999
 _ROPE_FRAME_RESCALE = 5.0 / 3.0
 _ROPE_FRAMES_PER_LATENT = (1, 4, 4, 4, 4)
 _ROPE_SPATIAL_SCALE = 32.0
@@ -67,6 +71,30 @@ def _temporal_grid(num_frames: int, origin: float) -> torch.Tensor:
     return origin + torch.cat((torch.zeros(1, dtype=torch.float64), spans[:-1].cumsum(0)))
 
 
+def _temporal_span(num_frames: int) -> float:
+    spans = np.ones(num_frames, dtype=np.float64) * _ROPE_FRAME_RESCALE
+    for index, multiplier in enumerate(_ROPE_FRAMES_PER_LATENT):
+        spans[index :: len(_ROPE_FRAMES_PER_LATENT)] *= multiplier
+    return float(spans.sum())
+
+
+def patchify_video_latents(
+    latents: torch.Tensor,
+    patch_size: tuple[int, int, int] = (1, 2, 2),
+) -> torch.Tensor:
+    """Convert a single ``[1,C,F,H,W]`` visual condition to H3 token rows."""
+    patch_t, patch_h, patch_w = patch_size
+    if latents.ndim != 5 or latents.shape[0] != 1:
+        raise ValueError(f"MiniMax-H3 keyframe latents must be [1,C,F,H,W], got {tuple(latents.shape)}.")
+    _, channels, frames, height, width = latents.shape
+    if frames % patch_t or height % patch_h or width % patch_w:
+        raise ValueError(f"Keyframe latent shape {tuple(latents.shape)} is not divisible by patch {patch_size}.")
+    latents = latents.reshape(
+        1, channels, frames // patch_t, patch_t, height // patch_h, patch_h, width // patch_w, patch_w
+    )
+    return latents.permute(0, 2, 4, 6, 1, 3, 5, 7).reshape(-1, channels * patch_t * patch_h * patch_w).contiguous()
+
+
 def build_packed_sequence(
     text_token_tags: torch.Tensor,
     num_latent_frames: int,
@@ -74,19 +102,22 @@ def build_packed_sequence(
     latent_width: int,
     num_audio_latents: int,
     patch_size: tuple[int, int, int] = (1, 2, 2),
+    keyframe_anchors: tuple[str, ...] = (),
 ) -> MiniMaxH3PackedSequence:
-    """Build the padless T2AV layout ``[text | stereo audio | video]``."""
+    """Build ``[text | keyframes | stereo audio | target video]`` for H3."""
     patch_t, patch_h, patch_w = patch_size
     if patch_t != 1:
-        raise ValueError(f"MiniMax-H3 T2AV expects temporal patch size 1, got {patch_size}.")
+        raise ValueError(f"MiniMax-H3 expects temporal patch size 1, got {patch_size}.")
     if latent_height % patch_h or latent_width % patch_w:
         raise ValueError(f"Latent canvas {latent_height}x{latent_width} is not divisible by patch {patch_size}.")
     text_token_tags = text_token_tags.to(device="cpu", dtype=torch.long).flatten()
     num_text = int(text_token_tags.numel())
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
+    num_condition_rows = len(keyframe_anchors) * rows_per_frame
     num_audio_rows = num_audio_latents * AUDIO_CHANNELS
     num_video_rows = num_latent_frames * rows_per_frame
-    audio_start = num_text
+    condition_start = num_text
+    audio_start = condition_start + num_condition_rows
     video_start = audio_start + num_audio_rows
     sequence_length = video_start + num_video_rows
 
@@ -96,6 +127,17 @@ def build_packed_sequence(
     height_grid = _spatial_grid(latent_height, patch_h, sqrt_area)
     width_grid = _spatial_grid(latent_width, patch_w, sqrt_area)
     frame_grid = torch.stack([axis.reshape(-1) for axis in torch.meshgrid(height_grid, width_grid, indexing="ij")], dim=-1)
+
+    for index, anchor in enumerate(keyframe_anchors):
+        if anchor == "first":
+            anchor_time = float(num_text)
+        elif anchor == "last":
+            anchor_time = float(num_text) + _temporal_span(num_latent_frames) - _ROPE_FRAME_RESCALE
+        else:
+            raise ValueError(f"A MiniMax-H3 keyframe anchor must be 'first' or 'last', got {anchor!r}.")
+        rows = slice(condition_start + index * rows_per_frame, condition_start + (index + 1) * rows_per_frame)
+        position_ids[rows, 0] = anchor_time
+        position_ids[rows, 1:] = frame_grid
 
     audio_time = float(num_text) + torch.arange(num_audio_latents, dtype=torch.float64)
     position_ids[audio_start:video_start, 0] = audio_time.repeat(AUDIO_CHANNELS)
@@ -112,7 +154,9 @@ def build_packed_sequence(
 
     text_indices = torch.arange(num_text, dtype=torch.long)
     audio_indices = torch.arange(audio_start, video_start, dtype=torch.long)
-    video_indices = torch.arange(video_start, sequence_length, dtype=torch.long)
+    condition_video_indices = torch.arange(condition_start, audio_start, dtype=torch.long)
+    target_video_indices = torch.arange(video_start, sequence_length, dtype=torch.long)
+    video_indices = torch.cat((condition_video_indices, target_video_indices))
     token_tags = torch.empty(sequence_length, dtype=torch.long)
     token_tags[text_indices] = text_token_tags
     token_tags[audio_indices] = AUDIO_TAG
@@ -124,6 +168,7 @@ def build_packed_sequence(
         video_indices,
         audio_indices,
         text_indices,
+        num_condition_video_rows=num_condition_rows,
     )
 
 
@@ -131,13 +176,15 @@ def build_row_timesteps(
     layout: MiniMaxH3PackedSequence,
     video_sigma: float | torch.Tensor,
     audio_sigma: float | torch.Tensor,
+    condition_video_timestep: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert modality sigmas to H3's clean-ward ``t=1-sigma`` rows."""
-    # Keep the subtraction in float32. The published scheduler materializes
-    # ``timesteps = 1 - sigmas`` as a tensor before converting values to
-    # Python floats; doing the subtraction in Python differs by one ulp.
     video_t = float((1.0 - torch.as_tensor(video_sigma, dtype=torch.float32)).item())
     audio_t = float((1.0 - torch.as_tensor(audio_sigma, dtype=torch.float32)).item())
+    if condition_video_timestep is None:
+        # Keyframe rows stay near the high-noise level used by H3 inference.
+        condition_video_timestep = max(video_t, KEYFRAME_NOISE_AUG)
     row_timesteps = torch.full((layout.sequence_length,), video_t, dtype=torch.float32)
+    row_timesteps[layout.video_indices[: layout.num_condition_video_rows]] = condition_video_timestep
     row_timesteps[layout.audio_indices] = audio_t
     return torch.unique(row_timesteps, sorted=True, return_inverse=True)

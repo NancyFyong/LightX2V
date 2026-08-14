@@ -18,6 +18,14 @@ _LAZY_EXPORTS = {
         "LTX2T2AVDmdTrainer",
     ),
     "LTX2T2AVFlowTrainer": (".flow", "LTX2T2AVFlowTrainer"),
+    "MiniMaxH3T2AVDmdTrainer": (
+        ".dmd.minimax_h3_trainer",
+        "MiniMaxH3T2AVDmdTrainer",
+    ),
+    "MiniMaxH3FL2AVDmdTrainer": (
+        ".dmd.minimax_h3_trainer",
+        "MiniMaxH3FL2AVDmdTrainer",
+    ),
     "LTX2T2AVTeacherForcingTrainer": (
         ".tf",
         "LTX2T2AVTeacherForcingTrainer",
@@ -62,6 +70,8 @@ __all__ = [
     "LTX2T2AVDmdTrainer",
     "LTX2T2AVFlowTrainer",
     "LTX2T2AVTeacherForcingTrainer",
+    "MiniMaxH3T2AVDmdTrainer",
+    "MiniMaxH3FL2AVDmdTrainer",
     "LingBotVideoDmdTrainer",
     "TFTrainer",
     "VideoArDmdTrainer",
