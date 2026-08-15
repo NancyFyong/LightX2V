@@ -4,9 +4,23 @@
 # through Qwen-VL prompt embeddings and source VAE latents.
 model:
     name: qwen_image_edit
-    pretrained_model_name_or_path: /path/to/Qwen/Qwen-Image-Edit-2511
+    pretrained_model_name_or_path: ${oc.env:QWEN_IMAGE_EDIT_3VIEWS_MODEL,/path/to/Qwen/Qwen-Image-Edit-2511-3views}
     max_sequence_length: 1024
     running_dtype: bf16
+
+distributed:
+    backend: nccl
+    timeout_minutes: 60
+    fsdp2:
+        enabled: true
+        reshard_after_forward:
+            root_reshard: false
+            block_reshard: true
+        mixed_precision:
+            param_dtype: bf16
+            reduce_dtype: fp32
+            output_dtype: null
+            cast_forward_inputs: false
 
 data:
     train:
@@ -16,13 +30,13 @@ data:
         target_area: 1048576 # 1024 * 1024
         shuffle: true
         data_path:
-            - /path/to/qwen_image_edit_train.jsonl
+            - ${oc.env:QWEN_IMAGE_EDIT_3VIEWS_TRAIN_JSONL,/path/to/qwen_image_edit_train.jsonl}
     val:
         name: image_dataset
         num_workers: 2
         shuffle: false
         data_path:
-            - /path/to/qwen_image_edit_val.jsonl
+            - ${oc.env:QWEN_IMAGE_EDIT_3VIEWS_VAL_JSONL,/path/to/qwen_image_edit_val.jsonl}
 
 scheduler:
     num_train_timesteps: 1000
@@ -35,7 +49,8 @@ scheduler:
 
 training:
     method: image_edit_dmd2
-    max_train_iters: 1000
+    # Formal run, not a short smoke test.
+    max_train_iters: 2000
     gradient_accumulation_iters: 1
     gradient_checkpointing: true
     max_grad_norm: 1.0
@@ -117,10 +132,19 @@ training:
         guidance_scale: 4.0
         negative_prompt: " "
         cfg_norm: layer_norm
-    output_dir: ./output_train/qwen_image_edit_2511_dmd2_lora
+    output_dir: ${oc.env:QWEN_IMAGE_EDIT_DMD2_OUTPUT_DIR,./output_train/qwen_image_edit_2511_dmd2_lora}
 
 inference:
-    method: none
+    method: image_infer
+    default_width: 1024
+    default_height: 1024
+    num_inference_steps: 4
+    enable_cfg: true
+    cfg_guidance_scale: 4.0
+    negative_prompt: " "
+    seed: 42
+    output_dir: ${oc.env:QWEN_IMAGE_EDIT_DMD2_INFER_DIR,./output_infer/qwen_image_edit_2511_dmd2_lora}
+    infer_every_iters: ${training.save_every_iters}
 
 logging:
     rank_zero_only: true
