@@ -101,6 +101,7 @@ _TRAINER_MODULES = {
     "ltx_t2av_ar_dmd": "lightx2v_train.trainers.dmd.ltx_trainer",
     "ltx_t2av_dmd": "lightx2v_train.trainers.dmd.ltx_trainer",
     "minimax_h3_t2av_dmd": "lightx2v_train.trainers.dmd.minimax_h3_trainer",
+    "minimax_h3_fl2av_dmd": "lightx2v_train.trainers.dmd.minimax_h3_trainer",
     "ltx_t2av_flow": "lightx2v_train.trainers.flow",
     "ltx_t2av_teacher_forcing": "lightx2v_train.trainers.tf",
     "teacher_forcing": "lightx2v_train.trainers.tf",

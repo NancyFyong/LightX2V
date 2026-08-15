@@ -4,9 +4,11 @@ import torch
 from loguru import logger
 
 from lightx2v_train.model_zoo.native.minimax_h3 import (
+    KEYFRAME_NOISE_AUG,
     audio_latent_num_frames,
     build_packed_sequence,
     build_row_timesteps,
+    patchify_video_latents,
     video_latent_num_frames,
 )
 from lightx2v_train.runtime.sequence_parallel import broadcast_sequence_parallel_value
@@ -244,3 +246,124 @@ class MiniMaxH3T2AVDmdTrainer(VideoDmdTrainer):
             self.audio_loss_weight,
         )
         return {"loss": loss, "dmd": loss.detach()}
+
+
+@TRAINER_REGISTER("minimax_h3_fl2av_dmd")
+class MiniMaxH3FL2AVDmdTrainer(MiniMaxH3T2AVDmdTrainer):
+    """DMD for H3 first-and-last-frame audio-video generation.
+
+    H3 represents the two visual anchors as noisy video rows placed between
+    Qwen conditioner rows and the generated audio/video rows.  They are model
+    conditions, not generated latents: every student/fake/teacher evaluation
+    receives the same rows and the DMD loss is computed only on target rows.
+    """
+
+    trainer_name = "minimax_h3_fl2av_dmd"
+
+    @staticmethod
+    def _normalise_keyframe_latents(value):
+        """Return the first/last cached VAE latents as two ``[1,C,F,H,W]`` tensors."""
+        if torch.is_tensor(value):
+            # Default DataLoader collation prepends the batch dimension.
+            if value.ndim == 6 and value.shape[0] == 1:
+                value = value[0]
+            if value.ndim != 5 or value.shape[0] != 2:
+                raise ValueError(
+                    "MiniMax-H3 FL2AV condition_video_latents must be [2,C,F,H,W] "
+                    "(or collated [1,2,C,F,H,W])."
+                )
+            values = [value[index : index + 1] for index in range(2)]
+        elif isinstance(value, (list, tuple)) and len(value) == 2:
+            values = []
+            for latent in value:
+                if not torch.is_tensor(latent):
+                    raise TypeError("MiniMax-H3 FL2AV keyframe latents must be tensors.")
+                if latent.ndim == 6 and latent.shape[0] == 1:
+                    latent = latent[0]
+                if latent.ndim == 4:
+                    latent = latent.unsqueeze(0)
+                if latent.ndim != 5 or latent.shape[0] != 1:
+                    raise ValueError("Each MiniMax-H3 FL2AV keyframe must have shape [1,C,F,H,W].")
+                values.append(latent)
+        else:
+            raise KeyError(
+                "MiniMax-H3 FL2AV requires conditioning.positive.condition_video_latents: "
+                "first and last cached VAE latents."
+            )
+        return values
+
+    def _prepare_cached_condition(self, condition):
+        prepared = super()._prepare_cached_condition(condition)
+        anchors = tuple(condition.get("keyframe_anchors", ("first", "last")))
+        if anchors != ("first", "last"):
+            raise ValueError(
+                "MiniMax-H3 FL2AV requires keyframe_anchors=['first', 'last'] in that order."
+            )
+
+        condition_rows = []
+        for latent in self._normalise_keyframe_latents(condition.get("condition_video_latents")):
+            latent = latent.to(device=self.model.device, dtype=self.latent_dtype)
+            rows = patchify_video_latents(latent, self.model.patch_size)
+            noise = torch.randn_like(rows, dtype=torch.float32)
+            rows = (KEYFRAME_NOISE_AUG * rows.float() + (1.0 - KEYFRAME_NOISE_AUG) * noise).to(self.latent_dtype)
+            condition_rows.append(rows)
+        prepared["condition_video_rows"] = torch.cat(condition_rows, dim=0)
+        prepared["keyframe_anchors"] = anchors
+        return prepared
+
+    def _layout(self, condition, latent_shape):
+        tags = condition["text_token_tags"]
+        key = (
+            tuple(tags.detach().cpu().tolist()),
+            latent_shape["latent_frames"],
+            latent_shape["latent_height"],
+            latent_shape["latent_width"],
+            latent_shape["audio_latents"],
+            self.model.patch_size,
+            condition["keyframe_anchors"],
+            self.model.device,
+        )
+        layout = self._layout_cache.get(key)
+        if layout is None:
+            layout = build_packed_sequence(
+                tags.detach().cpu(),
+                latent_shape["latent_frames"],
+                latent_shape["latent_height"],
+                latent_shape["latent_width"],
+                latent_shape["audio_latents"],
+                self.model.patch_size,
+                keyframe_anchors=condition["keyframe_anchors"],
+            ).to(self.model.device)
+            self._layout_cache[key] = layout
+        expected_rows = layout.num_condition_video_rows
+        if condition["condition_video_rows"].shape[0] != expected_rows:
+            raise ValueError(
+                "MiniMax-H3 FL2AV keyframe row count does not match the target video canvas: "
+                f"got {condition['condition_video_rows'].shape[0]}, expected {expected_rows}."
+            )
+        return layout
+
+    def _predict_velocity(self, model, latents, sigmas, condition, latent_shape):
+        target_video, target_audio = latents
+        condition_rows = condition["condition_video_rows"].to(
+            device=target_video.device,
+            dtype=target_video.dtype,
+        )
+        input_video = torch.cat((condition_rows, target_video), dim=0)
+        layout = self._layout(condition, latent_shape)
+        timesteps, timestep_indices = build_row_timesteps(layout, sigmas[0], sigmas[1])
+        with model.transformer_forward_context():
+            video_prediction, audio_prediction = model.denoiser_module()(
+                hidden_states=input_video,
+                audio_hidden_states=target_audio,
+                encoder_hidden_states=condition["prompt_embeds"],
+                timestep=timesteps.to(model.device),
+                timestep_indices=timestep_indices.to(model.device),
+                token_tags=layout.token_tags,
+                position_ids=layout.position_ids,
+                video_indices=layout.video_indices,
+                audio_indices=layout.audio_indices,
+                text_indices=layout.text_indices,
+                return_dict=False,
+            )
+        return video_prediction[condition_rows.shape[0] :], audio_prediction
