@@ -1,0 +1,130 @@
+# Clean-room DMD2 for Qwen-Image-Edit-2511.
+# The image_dataset JSONL rows must provide target_image, source_images, and prompt.
+# DMD2 uses target_image only for the real-latent GAN term; references are passed
+# through Qwen-VL prompt embeddings and source VAE latents.
+model:
+    name: qwen_image_edit
+    pretrained_model_name_or_path: /path/to/Qwen/Qwen-Image-Edit-2511
+    max_sequence_length: 1024
+    running_dtype: bf16
+
+data:
+    train:
+        name: image_dataset
+        num_workers: 8
+        prompt_dropout_rate: 0.0
+        target_area: 1048576 # 1024 * 1024
+        shuffle: true
+        data_path:
+            - /path/to/qwen_image_edit_train.jsonl
+    val:
+        name: image_dataset
+        num_workers: 2
+        shuffle: false
+        data_path:
+            - /path/to/qwen_image_edit_val.jsonl
+
+scheduler:
+    num_train_timesteps: 1000
+    time_shift_settings:
+        do_time_shift: true
+        shift_type: linear
+        time_shift_power: 1.0
+        dynamic_shift: false
+        time_shift_mu: 3.0
+
+training:
+    method: image_edit_dmd2
+    max_train_iters: 1000
+    gradient_accumulation_iters: 1
+    gradient_checkpointing: true
+    max_grad_norm: 1.0
+    lr_scheduler: constant
+    lr_warmup_iters: 10
+    save_every_iters: 100
+    save_total_limit: 10
+    dmd:
+        # Student's deployed rollout length.  It is also simulated during
+        # DMD2 training rather than using a teacher-only trajectory dataset.
+        num_inference_steps: 4
+        # Must equal dmd2.fake_updates_per_student.
+        fake_update_ratio: 5
+        image_sizes:
+            - [1024, 1024]
+        renoise_sigma_min: 0.02
+        renoise_sigma_max: 1.0
+        renoise_discrete_samples: 1000
+        renoise_shift: 5.0
+    dmd2:
+        # The fake score receives five updates for every student update.
+        # This is the two-time-scale critic schedule.
+        fake_updates_per_student: 5
+        gan:
+            enabled: true
+            # Generator weight for non-saturating conditional latent PatchGAN.
+            weight: 0.005
+            base_channels: 64
+            # Qwen-Image-Edit transformer joint_attention_dim.
+            condition_dim: 3584
+            max_grad_norm: 1.0
+            optimizer:
+                learning_rate: 0.0001
+                adam_beta1: 0.5
+                adam_beta2: 0.999
+                weight_decay: 0.0
+                adam_epsilon: 0.00000001
+    student:
+        train_type: lora
+        lora:
+            rank: 64
+            alpha: 64
+            target_modules:
+                - to_k
+                - to_q
+                - to_v
+                - to_out.0
+                - add_k_proj
+                - add_q_proj
+                - add_v_proj
+                - to_add_out
+                - img_mlp.net.0.proj
+                - img_mlp.net.2
+                - txt_mlp.net.0.proj
+                - txt_mlp.net.2
+        optimizer:
+            learning_rate: 0.0001
+            adam_beta1: 0.9
+            adam_beta2: 0.999
+            weight_decay: 0.001
+            adam_epsilon: 0.00000001
+    fake:
+        train_type: lora
+        lora:
+            rank: 64
+            alpha: 64
+            target_modules:
+                - to_k
+                - to_q
+                - to_v
+                - to_out.0
+        optimizer:
+            learning_rate: 0.00002
+            adam_beta1: 0.9
+            adam_beta2: 0.999
+            weight_decay: 0.001
+            adam_epsilon: 0.00000001
+    teacher:
+        guidance_scale: 4.0
+        negative_prompt: " "
+        cfg_norm: layer_norm
+    output_dir: ./output_train/qwen_image_edit_2511_dmd2_lora
+
+inference:
+    method: none
+
+logging:
+    rank_zero_only: true
+    train_log_every_iters: 10
+
+resume:
+    auto_resume: true
