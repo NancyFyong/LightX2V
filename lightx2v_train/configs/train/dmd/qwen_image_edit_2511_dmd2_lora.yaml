@@ -139,7 +139,9 @@ inference:
     default_width: 1024
     default_height: 1024
     num_inference_steps: 4
-    enable_cfg: true
+    # The student is distilled against the teacher's CFG=4 target. Do not apply
+    # a second CFG pass at deployment/validation time.
+    enable_cfg: false
     cfg_guidance_scale: 4.0
     negative_prompt: " "
     seed: 42
