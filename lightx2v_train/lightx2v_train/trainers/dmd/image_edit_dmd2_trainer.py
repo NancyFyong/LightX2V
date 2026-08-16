@@ -175,8 +175,12 @@ class ImageEditDmd2Trainer(ImageEditDmdTrainer):
             base_channels=self.gan_base_channels,
         ).to(device=self.model.device, dtype=torch.float32)
         if is_distributed():
-            for tensor in list(self.gan_discriminator.parameters()) + list(self.gan_discriminator.buffers()):
-                dist.broadcast(tensor, src=0)
+            # This is one-time parameter initialization, not a differentiable
+            # collective. Recording it in autograd produces c10d::broadcast_
+            # warnings during backward and can lead to incorrect gradients.
+            with torch.no_grad():
+                for tensor in list(self.gan_discriminator.parameters()) + list(self.gan_discriminator.buffers()):
+                    dist.broadcast(tensor, src=0)
         self.gan_optimizer = self._build_optimizer(self.gan_discriminator.parameters(), self.gan_optimizer_config)
         self.gan_lr_scheduler = self._build_lr_scheduler(
             self.gan_optimizer,
