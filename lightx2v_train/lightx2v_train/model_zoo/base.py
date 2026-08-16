@@ -191,11 +191,45 @@ class BaseModel:
         """Return per-sample kwargs to pass to pipeline.__call__ during native inference."""
         return {}
 
+    @staticmethod
+    def _normalize_lora_state_dict_for_direct_peft_load(state_dict):
+        """Normalize Diffusers ``lora.down/up`` names for PEFT's direct loader.
+
+        ``save_lora_weights`` may emit Diffusers-format keys while a direct
+        ``denoiser.load_lora_adapter`` call expects PEFT ``lora_A/B`` names.
+        Keep component prefixes (for example ``transformer.``) intact: Diffusers
+        uses them to select the state dict for the denoiser.
+        """
+        normalized = {}
+        converted_count = 0
+        for key, value in state_dict.items():
+            normalized_key = key.replace(".lora.down.weight", ".lora_A.weight")
+            normalized_key = normalized_key.replace(".lora.up.weight", ".lora_B.weight")
+            if normalized_key != key:
+                converted_count += 1
+            if normalized_key in normalized:
+                raise ValueError(f"LoRA key collision while normalizing {key!r} -> {normalized_key!r}.")
+            normalized[normalized_key] = value
+        return normalized, converted_count
+
     def load_lora_for_infer(self, lora_path, adapter_name=None):
         denoiser = self.denoiser_module()
         if adapter_name is None:
             adapter_name = get_adapter_name(denoiser)
-        denoiser.load_lora_adapter(lora_path, adapter_name=adapter_name)
+
+        # Checkpoints saved through ``pipeline_cls.save_lora_weights`` can mix
+        # Diffusers ``lora.down/up`` and PEFT ``lora_A/B`` keys. Normalize local
+        # safetensors in memory so every checkpoint can be used directly by
+        # infer.py; no converted sidecar checkpoint is required.
+        is_local_safetensors = os.path.isfile(lora_path) and str(lora_path).endswith(".safetensors")
+        if is_local_safetensors:
+            state_dict = load_file(lora_path)
+            state_dict, converted_count = self._normalize_lora_state_dict_for_direct_peft_load(state_dict)
+            if converted_count:
+                logger.info("Normalized {} Diffusers LoRA tensor keys for direct PEFT inference load.", converted_count)
+            denoiser.load_lora_adapter(state_dict, adapter_name=adapter_name)
+        else:
+            denoiser.load_lora_adapter(lora_path, adapter_name=adapter_name)
         self._infer_lora_adapter_name = adapter_name
 
     def unload_lora_for_infer(self):
