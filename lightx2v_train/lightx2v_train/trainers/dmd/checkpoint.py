@@ -5,6 +5,7 @@ import warnings
 import torch
 import torch.distributed.checkpoint as dcp
 from loguru import logger
+from torch.distributed.checkpoint import DefaultLoadPlanner
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -288,7 +289,31 @@ class DmdCheckpointManager:
             "fake_model": fake_model_state,
             "fake_optimizer": fake_optim_state,
         }
-        dcp.load(state, checkpoint_id=dist_state_path)
+        # Model weights must always restore strictly. Optimizers may legitimately
+        # omit state for LoRA parameters that have never received a gradient:
+        # Adam creates those slots lazily, and DCP does not serialize absent
+        # slots. Load optimizer state separately with a partial planner so such
+        # parameters resume with fresh optimizer slots instead of making an
+        # otherwise complete FSDP checkpoint unresumable.
+        dcp.load(
+            {
+                "student_model": state["student_model"],
+                "fake_model": state["fake_model"],
+            },
+            checkpoint_id=dist_state_path,
+        )
+        dcp.load(
+            {
+                "student_optimizer": state["student_optimizer"],
+                "fake_optimizer": state["fake_optimizer"],
+            },
+            checkpoint_id=dist_state_path,
+            planner=DefaultLoadPlanner(allow_partial_load=True),
+        )
+        logger.warning(
+            "[checkpoint][resume] optimizer state loaded with allow_partial_load; "
+            "LoRA parameters absent from checkpoint optimizer state resume with fresh slots."
+        )
         set_state_dict(
             self.model.fsdp2_state_module(),
             self.optimizer,
